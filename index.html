@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>LearnAI</title>
+  <meta name="description" content="Build bite-sized AI courses tailored to your career.">
+  <meta name="theme-color" content="#0b1026">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="LearnAI">
+  <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+  <link rel="icon" type="image/png" sizes="192x192" href="icons/icon-192.png">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="stars" aria-hidden="true"></div>
+
+  <header class="topbar">
+    <div class="brand"><span class="brand-logo">🚀</span> LearnAI</div>
+    <div class="stats">
+      <span class="pill" id="streakPill" title="Day streak">🔥 <b id="streakCount">0</b></span>
+      <span class="pill" id="xpPill" title="Experience points">⚡ <b id="xpCount">0</b></span>
+    </div>
+  </header>
+
+  <main id="app" class="view-root" aria-live="polite"></main>
+
+  <nav class="tabbar" aria-label="Main">
+    <button class="tab" data-tab="home"><span>🏠</span>Home</button>
+    <button class="tab" data-tab="library"><span>📚</span>Library</button>
+    <button class="tab" data-tab="profile"><span>👩‍🚀</span>Profile</button>
+  </nav>
+
+  <div id="toast" class="toast" role="status"></div>
+  <canvas id="confetti" aria-hidden="true"></canvas>
+
+  <script src="sample-course.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
