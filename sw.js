@@ -1,5 +1,5 @@
 // Offline cache for the app shell. Bump VERSION when shipping changes.
-const VERSION = "learnai-v2";
+const VERSION = "learnai-v3";
 const SHELL = ["./", "index.html", "styles.css", "app.js", "sample-course.js", "manifest.webmanifest",
   "icons/apple-touch-icon.png", "icons/icon-192.png", "icons/icon-512.png"];
 

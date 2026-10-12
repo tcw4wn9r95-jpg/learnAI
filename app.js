@@ -382,6 +382,54 @@
     next_topics: arr(str),
   });
 
+  // A compact example of the JSON shape, used to describe the format in the prompt.
+  // (The full course schema is too large for strict structured outputs.)
+  function schemaShape(sc) {
+    if (sc.type === "object") return Object.fromEntries(Object.entries(sc.properties).map(([k, v]) => [k, schemaShape(v)]));
+    if (sc.type === "array") return [schemaShape(sc.items)];
+    if (sc.enum) return sc.enum.join("|");
+    return sc.type;
+  }
+
+  // Parse the model's JSON, then check and repair it so one bad field can't break the lesson player.
+  function parseCourse(text) {
+    const start = text.indexOf("{"), end = text.lastIndexOf("}");
+    if (start < 0 || end <= start) throw new SyntaxError("No JSON object in response");
+    const c = JSON.parse(text.slice(start, end + 1));
+    const list = (x) => (Array.isArray(x) ? x : []);
+    const txt = (x) => (typeof x === "string" ? x : x == null ? "" : String(x));
+    c.lessons = list(c.lessons).filter((l) => l && l.title && l.theory && l.example);
+    if (!c.lessons.length) throw new Error("The course came back incomplete. Please try again.");
+    c.title = txt(c.title) || "Your AI course";
+    c.cheat_sheet = list(c.cheat_sheet).map(txt);
+    c.next_topics = list(c.next_topics).map(txt);
+    c.final_challenge = c.final_challenge?.title ? c.final_challenge : { title: "Your 1-week challenge 🚀", description: "Use one idea from this course at work this week." };
+    c.lessons.forEach((l) => {
+      l.theory.points = list(l.theory.points).map(txt);
+      l.key_terms = list(l.key_terms).filter((t) => t?.term);
+      l.example.steps = list(l.example.steps).map(txt);
+      l.use_cases = list(l.use_cases).filter((u) => u?.title);
+      l.quiz = list(l.quiz).filter((q) => q?.question && list(q.options).length >= 2);
+      l.quiz.forEach((q) => { q.answer_index = Math.min(Math.max(0, parseInt(q.answer_index, 10) || 0), q.options.length - 1); });
+      if (!l.quiz.length) l.quiz = [{ question: "Ready to use this at work?", options: ["Yes! 🚀", "Absolutely 💪"], answer_index: 0, explanation: "Nice. Try the take-it-to-work prompt this week." }];
+      if (!l.try_it?.prompt) delete l.try_it;
+      const sim = l.simulation;
+      const validSim = sim && sim.setting && sim.build?.task && list(sim.artifacts).length && list(sim.build.rubric).length;
+      if (!validSim) { delete l.simulation; return; }
+      sim.title = txt(sim.title) || "Mission";
+      sim.artifacts = sim.artifacts.filter((a) => a?.content).map((a) => ({ ...a, kind: ["email", "table", "document", "note"].includes(a.kind) ? a.kind : "document", title: txt(a.title) || "File" }));
+      sim.checkpoints = list(sim.checkpoints)
+        .filter((cp) => cp?.situation && list(cp.options).length >= 2)
+        .map((cp) => ({ ...cp, options: cp.options.map((o) => ({ text: txt(o.text), consequence: txt(o.consequence), rating: ["best", "okay", "risky"].includes(o.rating) ? o.rating : "okay" })) }))
+        .slice(0, 2);
+      sim.build.deliverable = sim.build.deliverable === "plan" ? "plan" : "ai_prompt";
+      sim.build.rubric = sim.build.rubric.map(txt);
+      sim.build.hint = txt(sim.build.hint);
+      sim.build.model_answer = txt(sim.build.model_answer);
+    });
+    return c;
+  }
+
   const SYSTEM_PROMPT = `You are LearnAI, an upbeat, expert instructor who designs short, practical micro-courses about artificial intelligence for working professionals.
 
 Write for someone reading on a phone: short sentences, plain language, no fluff, a little playful energy and the occasional emoji. Explain jargon the first time it appears. You may use **bold** for emphasis; use no other markdown.
@@ -406,7 +454,10 @@ Lesson structure:
 - try_it: a ready-to-copy prompt the learner can use at work this week (with [placeholders] for their own non-sensitive details), so they transfer the skill to real life.
 - quiz: exactly 2 multiple-choice questions with 4 options each, answer_index is 0-based, plus a short explanation. Vary the position of the correct answer.
 
-Also provide a 5-7 item cheat_sheet, a fun one-week final_challenge, and 3 next_topics. Each emoji field holds a single emoji.`;
+Also provide a 5-7 item cheat_sheet, a fun one-week final_challenge, and 3 next_topics. Each emoji field holds a single emoji.
+
+Respond with only one JSON object (no code fences, no text before or after it) with exactly this shape, where "a|b" means one of those values:
+${JSON.stringify(schemaShape(COURSE_SCHEMA))}`;
 
   function buildUserPrompt(topic) {
     const p = state.profile;
@@ -498,10 +549,9 @@ Number of lessons: exactly ${LENGTHS[p.length] || 3}. Each lesson should take 3-
         system: SYSTEM_PROMPT,
         user: buildUserPrompt(topic),
         maxTokens: 64000,
-        schema: COURSE_SCHEMA,
       }));
       stream.on("text", (delta) => { chars += delta.length; bar(); });
-      const course = JSON.parse(messageText(await stream.finalMessage()));
+      const course = parseCourse(messageText(await stream.finalMessage()));
       if (!course?.lessons?.length) throw new Error("The course came back empty. Please try again.");
 
       const c = { id: uid(), topic, createdAt: Date.now(), course, progress: {} };
