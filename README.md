@@ -1,6 +1,8 @@
 # 🚀 LearnAI
 
-A fun, mobile-first web app that turns any AI topic into a short course tailored to **your career**: simple theory, a practical worked example, use cases from your own roles (including International Supply Chain at Blue Origin), a copy-ready prompt to try, and a quiz. Earn XP, keep a streak and collect a cheat sheet at the end.
+A fun, mobile-first web app that turns any AI topic into a short course tailored to **your career**: simple theory, a worked example, use cases from your own roles (including International Supply Chain at Blue Origin), and a **hands-on mission simulation** in every lesson. In each mission you work with realistic (fictional) files, make judgment calls with real consequences, and write a prompt or plan. The AI actually runs your prompt and a coach scores it against a rubric so you can retry. Earn XP, keep a streak and collect a cheat sheet at the end.
+
+Why it's designed this way: see [BENCHMARK.md](BENCHMARK.md).
 
 ## Use it on iPhone
 1. Open the GitHub Pages URL in **Safari**.

@@ -9,7 +9,7 @@
     "claude-haiku-5-5": { label: "Claude Haiku 5.5", note: "Fastest, cheapest", effort: "low", fallbacks: false },
   };
   const LENGTHS = { quick: 3, standard: 5, deep: 7 };
-  const XP = { lessonDone: 50, correct: 10, courseDone: 100 };
+  const XP = { lessonDone: 50, correct: 10, courseDone: 100, simDone: 20 };
   const RANKS = ["Ground Crew", "Launch Tech", "Flight Engineer", "Mission Specialist", "Payload Commander", "Astronaut", "Orbital Legend"];
   const SUGGESTIONS = [
     "AI agents for procurement", "Predictive analytics for supplier risk", "Prompt engineering basics",
@@ -57,6 +57,8 @@
     tab: "home",
   };
   if (!MODELS[state.model]) state.model = "claude-opus-5-5";
+  // Keep the built-in sample course in sync with the latest version shipped with the app.
+  state.courses.forEach((c) => { if (c.sample) c.course = window.SAMPLE_COURSE; });
 
   const save = () => {
     store.set("profile", state.profile);
@@ -363,6 +365,15 @@
       key_terms: arr(obj({ term: str, definition: str })),
       example: obj({ role: str, title: str, scenario: str, steps: arr(str), outcome: str }),
       use_cases: arr(obj({ role: str, title: str, description: str, impact: str })),
+      simulation: obj({
+        title: str, setting: str, objective: str,
+        artifacts: arr(obj({ kind: { type: "string", enum: ["email", "table", "document", "note"] }, title: str, content: str })),
+        checkpoints: arr(obj({
+          situation: str,
+          options: arr(obj({ text: str, rating: { type: "string", enum: ["best", "okay", "risky"] }, consequence: str })),
+        })),
+        build: obj({ task: str, deliverable: { type: "string", enum: ["ai_prompt", "plan"] }, hint: str, rubric: arr(str), model_answer: str }),
+      }),
       try_it: obj({ instructions: str, prompt: str }),
       quiz: arr(obj({ question: str, options: arr(str), answer_index: { type: "integer" }, explanation: str })),
     })),
@@ -387,7 +398,12 @@ Lesson structure:
 - key_terms: 2-4 terms with one-sentence definitions.
 - example: one hands-on worked example in the learner's job with 3-5 concrete steps and the outcome.
 - use_cases: 2-3 use cases, each with a short impact line starting with an emoji.
-- try_it: a ready-to-copy prompt the learner can paste into an AI assistant today (with [placeholders] for their own non-sensitive details).
+- simulation: the heart of the lesson. A realistic, hands-on workplace mission where the learner applies the concept themselves (the worked example showed it; now they do it). Set it in one of the learner's roles, using the International Supply Chain role for at least half the lessons when they have one.
+  - setting: 2-3 sentences: who they are, what's happening, the deadline or stakes. objective: what they must accomplish.
+  - artifacts: 1-3 fictional work materials to work with (kind email, table, document or note). Make them feel real and a little messy: mixed formats or units, a buried key detail, a conflicting date or number, and where relevant one item that must not go into an AI tool (e.g. proprietary pricing or something marked export-controlled). For tables, put a header row first, one row per line, cells separated by " | ". Invent all names, companies and part numbers.
+  - checkpoints: exactly 2 judgment calls with 3 options each. Rate exactly one option "best", one "okay" and one "risky", in varied order. Checkpoint 1 happens before the build (e.g. what data to give the AI, which approach). Checkpoint 2 happens after the AI step (e.g. the output has an error, or a stakeholder wants to skip review). Each consequence is 1-2 sentences describing what realistically happens next.
+  - build: the core hands-on task, applied to the artifacts. Use deliverable "ai_prompt" when the learner should write the instructions they would give an AI assistant; the app actually runs their prompt on the artifacts and shows the output. Use "plan" when the concept needs a short implementation plan, workflow, spec or decision instead (e.g. designing an AI agent or a forecasting pilot). task is a clear instruction, hint is one nudge that doesn't give the answer away, rubric has 3-5 specific checkable criteria, and model_answer is a strong reference answer.
+- try_it: a ready-to-copy prompt the learner can use at work this week (with [placeholders] for their own non-sensitive details), so they transfer the skill to real life.
 - quiz: exactly 2 multiple-choice questions with 4 options each, answer_index is 0-based, plus a short explanation. Vary the position of the correct answer.
 
 Also provide a 5-7 item cheat_sheet, a fun one-week final_challenge, and 3 next_topics. Each emoji field holds a single emoji.`;
@@ -414,6 +430,48 @@ ${p.interests ? `Interests and goals: ${p.interests}` : ""}
 Number of lessons: exactly ${LENGTHS[p.length] || 3}. Each lesson should take 3-6 minutes.`;
   }
 
+  // ---------- Claude helpers ----------
+  let sdkPromise = null;
+  async function getClient() {
+    sdkPromise ||= import(SDK_URL).catch((e) => { sdkPromise = null; throw e; });
+    const { default: Anthropic } = await sdkPromise;
+    return new Anthropic({ apiKey: state.apiKey, dangerouslyAllowBrowser: true });
+  }
+
+  function buildParams({ system, user, maxTokens, effort, schema }) {
+    const m = MODELS[state.model];
+    const params = {
+      model: state.model,
+      max_tokens: maxTokens,
+      system,
+      messages: [{ role: "user", content: user }],
+      output_config: { effort: effort || m.effort },
+    };
+    if (schema) params.output_config.format = { type: "json_schema", schema };
+    if (m.fallbacks) {
+      params.betas = ["server-side-fallback-2026-07-01"];
+      params.fallbacks = "default";
+    }
+    return params;
+  }
+
+  function messageText(msg) {
+    if (msg.stop_reason === "refusal") throw new Error("The AI declined this request. Try rephrasing it.");
+    if (msg.stop_reason === "max_tokens") throw new Error("The response came out too long. Try something shorter.");
+    return msg.content.filter((b) => b.type === "text").map((b) => b.text).join("");
+  }
+
+  function friendlyError(err) {
+    const status = err?.status;
+    const msg = err?.message || "Something went wrong.";
+    if (status === 401) return "Your API key was rejected. Double-check it in Profile.";
+    if (status === 429) return "Rate limit hit. Wait a minute and try again.";
+    if (status === 529 || status >= 500) return "Claude is busy right now. Please try again shortly.";
+    if (err instanceof SyntaxError) return "The response got scrambled in transit. Please try again.";
+    if (!status && /connection|fetch|import|module|network/i.test(msg)) return "Couldn't reach Claude. Check your internet connection and try again.";
+    return msg;
+  }
+
   async function generateCourse(topic) {
     document.body.classList.add("in-lesson");
     view(`
@@ -421,42 +479,29 @@ Number of lessons: exactly ${LENGTHS[p.length] || 3}. Each lesson should take 3-
         <div class="rocket-big">🚀</div><div class="exhaust"></div>
         <div class="gen-msg" id="genMsg">${GEN_MESSAGES[0]}</div>
         <div class="progress"><div id="genBar"></div></div>
-        <p class="muted small">Building “${esc(topic)}” for your career. This usually takes 30–90 seconds.</p>
+        <p class="muted small">Building “${esc(topic)}” for your career. This usually takes 1–2 minutes.</p>
         <button class="btn ghost small" id="cancelGen">Cancel</button>
       </div>`);
 
     let i = 0;
     const msgTimer = setInterval(() => { $("#genMsg") && ($("#genMsg").textContent = GEN_MESSAGES[++i % GEN_MESSAGES.length]); }, 3500);
     const lessons = LENGTHS[state.profile.length] || 3;
-    const expectedChars = 2800 * lessons + 1500;
+    const expectedChars = 5200 * lessons + 1500;
     let chars = 0, stream = null, cancelled = false;
     const bar = () => { const b = $("#genBar"); if (b) b.style.width = Math.min(96, 4 + (chars / expectedChars) * 92) + "%"; };
     bar();
     $("#cancelGen").addEventListener("click", () => { cancelled = true; stream?.abort(); });
 
     try {
-      const { default: Anthropic } = await import(SDK_URL);
-      const client = new Anthropic({ apiKey: state.apiKey, dangerouslyAllowBrowser: true });
-      const m = MODELS[state.model];
-      const params = {
-        model: state.model,
-        max_tokens: 32000,
+      const client = await getClient();
+      stream = client.beta.messages.stream(buildParams({
         system: SYSTEM_PROMPT,
-        messages: [{ role: "user", content: buildUserPrompt(topic) }],
-        output_config: { effort: m.effort, format: { type: "json_schema", schema: COURSE_SCHEMA } },
-      };
-      if (m.fallbacks) {
-        params.betas = ["server-side-fallback-2026-07-01"];
-        params.fallbacks = "default";
-      }
-      stream = client.beta.messages.stream(params);
+        user: buildUserPrompt(topic),
+        maxTokens: 64000,
+        schema: COURSE_SCHEMA,
+      }));
       stream.on("text", (delta) => { chars += delta.length; bar(); });
-      const msg = await stream.finalMessage();
-
-      if (msg.stop_reason === "refusal") throw new Error("The AI declined this topic. Try rephrasing it.");
-      if (msg.stop_reason === "max_tokens") throw new Error("The course came out too long. Try the Quick length.");
-      const text = msg.content.filter((b) => b.type === "text").map((b) => b.text).join("");
-      const course = JSON.parse(text);
+      const course = JSON.parse(messageText(await stream.finalMessage()));
       if (!course?.lessons?.length) throw new Error("The course came back empty. Please try again.");
 
       const c = { id: uid(), topic, createdAt: Date.now(), course, progress: {} };
@@ -476,12 +521,7 @@ Number of lessons: exactly ${LENGTHS[p.length] || 3}. Each lesson should take 3-
 
   function renderGenError(topic, err) {
     const status = err?.status;
-    let msg = err?.message || "Something went wrong.";
-    if (status === 401) msg = "Your API key was rejected. Double-check it in Profile.";
-    else if (status === 429) msg = "Rate limit hit. Wait a minute and try again.";
-    else if (status === 529 || status >= 500) msg = "Claude is busy right now. Please try again shortly.";
-    else if (err instanceof SyntaxError) msg = "The course got scrambled in transit. Please try again.";
-    else if (!status && /connection|fetch|import|module|network/i.test(msg)) msg = "Couldn't reach Claude. Check your internet connection and try again.";
+    const msg = friendlyError(err);
     view(`
       <div class="card center" style="margin-top:30px">
         <div style="font-size:64px">🛸</div>
@@ -524,7 +564,7 @@ Number of lessons: exactly ${LENGTHS[p.length] || 3}. Each lesson should take 3-
       ${co.lessons.map((l, i) => `
         <button class="lesson-row ${c.progress[i]?.done ? "done" : ""} ${i === nextIdx ? "next" : ""}" data-l="${i}">
           <div class="num">${c.progress[i]?.done ? "✓" : i + 1}</div>
-          <div class="meta"><b>${esc(l.emoji || "")} ${esc(l.title)}</b><div class="muted small">${esc(l.minutes || 4)} min${c.progress[i]?.done ? ` · quiz ${c.progress[i].score}/${l.quiz.length}` : ""}</div></div>
+          <div class="meta"><b>${esc(l.emoji || "")} ${esc(l.title)}</b><div class="muted small">${esc(l.minutes || 4)} min${l.simulation ? " · 🎮 mission" : ""}${c.progress[i]?.done ? `${c.progress[i].sim != null ? ` · 🎮 ${c.progress[i].sim}` : ""} · quiz ${c.progress[i].score}/${l.quiz.length}` : ""}</div></div>
           <div>${i === nextIdx ? "▶️" : ""}</div>
         </button>`).join("")}
       ${p.done === p.total ? `<button class="btn warm block" id="finish">🏆 View certificate & cheat sheet</button>` : `
@@ -556,17 +596,29 @@ Number of lessons: exactly ${LENGTHS[p.length] || 3}. Each lesson should take 3-
   const STEPS = [
     { key: "theory", tag: "🧠 Theory" },
     { key: "terms", tag: "🔤 Key terms" },
-    { key: "example", tag: "🛠️ Practical example" },
+    { key: "example", tag: "🛠️ Worked example" },
     { key: "usecases", tag: "💼 Use cases for you" },
+    { key: "sim", tag: "🎮 Mission simulation" },
     { key: "tryit", tag: "⚡ Try it now" },
-    { key: "quiz", tag: "🎯 Quiz" },
+    { key: "quiz", tag: "🎯 Quick recall" },
   ];
+
+  function lessonSteps(lesson) {
+    return STEPS.filter((s) => {
+      if (s.key === "terms") return lesson.key_terms?.length;
+      if (s.key === "sim") return !!lesson.simulation;
+      // Lessons with a simulation move the try-it prompt to the lesson-complete screen.
+      if (s.key === "tryit") return !lesson.simulation && lesson.try_it;
+      return true;
+    });
+  }
 
   function openLesson(id, idx) {
     const c = getCourse(id);
     const lesson = c.course.lessons[idx];
-    const steps = STEPS.filter((s) => s.key !== "terms" || lesson.key_terms?.length);
+    const steps = lessonSteps(lesson);
     const qState = { q: 0, score: 0, answered: false };
+    const sim = newSimState();
     let step = 0;
     document.body.classList.add("in-lesson");
 
@@ -585,16 +637,16 @@ Number of lessons: exactly ${LENGTHS[p.length] || 3}. Each lesson should take 3-
         const e = lesson.example;
         body = `<span class="role-badge">💼 ${esc(e.role)}</span><h2 style="margin-top:0">${esc(e.title)}</h2>
           <p>${md(e.scenario)}</p><ol class="steps">${e.steps.map((x) => `<li>${md(x)}</li>`).join("")}</ol>
-          <div class="outcome">🎉 <b>Result:</b> ${md(e.outcome)}</div>`;
+          <div class="outcome">🎉 <b>Result:</b> ${md(e.outcome)}</div>
+          ${lesson.simulation ? `<p class="muted small" style="margin-top:12px">👀 Watch closely. Next you'll run a mission like this yourself.</p>` : ""}`;
       } else if (s.key === "usecases") {
         body = `<h2 style="margin-top:0">Where this shows up in your work</h2>
           ${lesson.use_cases.map((u) => `<div class="usecase"><span class="role-badge">${esc(u.role)}</span><h3>${esc(u.title)}</h3>
             <p class="small" style="margin:0">${md(u.description)}</p><div class="impact">${esc(u.impact)}</div></div>`).join("")}`;
+      } else if (s.key === "sim") {
+        body = `<div id="simRoot"></div>`;
       } else if (s.key === "tryit") {
-        body = `<h2 style="margin-top:0">Your 2-minute mission</h2><p>${md(lesson.try_it.instructions)}</p>
-          <div class="prompt-box" id="promptBox">${esc(lesson.try_it.prompt)}</div>
-          <button class="btn block" id="copyPrompt">📋 Copy prompt</button>
-          <p class="muted small" style="margin-top:10px">🛡️ Use an approved tool and keep sensitive or export-controlled data out.</p>`;
+        body = tryItHtml(lesson.try_it);
       } else if (s.key === "quiz") {
         const q = lesson.quiz[qState.q];
         body = `<p class="muted small">Question ${qState.q + 1} of ${lesson.quiz.length} · +${XP.correct} XP each</p>
@@ -604,6 +656,9 @@ Number of lessons: exactly ${LENGTHS[p.length] || 3}. Each lesson should take 3-
       }
 
       const isQuiz = s.key === "quiz";
+      const isSim = s.key === "sim";
+      const nextLabel = isQuiz ? (qState.q < lesson.quiz.length - 1 ? "Next question →" : "Finish lesson 🏁")
+        : isSim ? (sim.phase === "debrief" ? "Continue →" : "Complete the mission to continue") : "Continue →";
       app.innerHTML = `<div class="view">
         <div class="lesson-head"><button class="icon-btn" id="close" aria-label="Close">✕</button>
           <div class="dots">${steps.map((_, i) => `<span class="${i <= step ? "on" : ""}"></span>`).join("")}</div></div>
@@ -612,16 +667,18 @@ Number of lessons: exactly ${LENGTHS[p.length] || 3}. Each lesson should take 3-
       </div>
       <div class="sticky-actions"><div class="inner">
         ${step > 0 && !isQuiz ? `<button class="btn ghost" id="prev" style="flex:.5">←</button>` : ""}
-        <button class="btn primary" id="next" ${isQuiz && !qState.answered ? "disabled" : ""}>${isQuiz ? (qState.q < lesson.quiz.length - 1 ? "Next question →" : "Finish lesson 🏁") : "Continue →"}</button>
+        <button class="btn primary" id="next" ${(isQuiz && !qState.answered) || (isSim && sim.phase !== "debrief") ? "disabled" : ""}>${nextLabel}</button>
       </div></div>`;
       window.scrollTo(0, 0);
 
       $("#close").addEventListener("click", () => openCourse(id));
       $("#prev")?.addEventListener("click", () => { step--; renderStep(); });
       $$(".term").forEach((t) => t.addEventListener("click", () => t.classList.toggle("open")));
-      $("#copyPrompt")?.addEventListener("click", async () => {
-        try { await navigator.clipboard.writeText(lesson.try_it.prompt); toast("Prompt copied! Paste it into your AI tool ✨"); }
-        catch { toast("Long-press the prompt to copy it"); }
+      bindCopy(lesson.try_it);
+      if (isSim) renderSim($("#simRoot"), lesson.simulation, sim, () => {
+        const n = $("#next");
+        n.disabled = false;
+        n.textContent = "Continue →";
       });
 
       if (isQuiz) {
@@ -642,16 +699,308 @@ Number of lessons: exactly ${LENGTHS[p.length] || 3}. Each lesson should take 3-
       $("#next").addEventListener("click", () => {
         if (!isQuiz) { step++; renderStep(); return; }
         if (qState.q < lesson.quiz.length - 1) { qState.q++; qState.answered = false; renderStep(); return; }
-        finishLesson(id, idx, qState.score);
+        finishLesson(id, idx, qState.score, sim.phase === "debrief" ? simScore(sim) : null);
       });
     };
     renderStep();
   }
 
-  function finishLesson(id, idx, score) {
+  function tryItHtml(t) {
+    return `<h2 style="margin-top:0">Your 2-minute mission</h2><p>${md(t.instructions)}</p>
+      <div class="prompt-box">${esc(t.prompt)}</div>
+      <button class="btn block" id="copyPrompt">📋 Copy prompt</button>
+      <p class="muted small" style="margin-top:10px">🛡️ Use an approved tool and keep sensitive or export-controlled data out.</p>`;
+  }
+
+  function bindCopy(t) {
+    $("#copyPrompt")?.addEventListener("click", async () => {
+      try { await navigator.clipboard.writeText(t.prompt); toast("Prompt copied! Paste it into your AI tool ✨"); }
+      catch { toast("Long-press the prompt to copy it"); }
+    });
+  }
+
+  // ---------- mission simulation ----------
+  // Flow: brief → checkpoint 1 → build (write it, run it on real AI, get rubric feedback, retry) → checkpoint 2 → debrief.
+  const CP_POINTS = { best: 15, okay: 8, risky: 0 };
+
+  function newSimState() {
+    return { phase: "brief", picks: [], draft: "", aiOutput: "", review: null, best: null, attempts: 0, busy: false };
+  }
+
+  function simScore(sim) {
+    const cp = sim.picks.reduce((n, r) => n + (CP_POINTS[r] || 0), 0);
+    return Math.round((sim.best ?? 0) * 0.7 + cp);
+  }
+
+  function artifactHtml(a, open) {
+    const icon = { email: "✉️", table: "📊", document: "📄", note: "🗒️" }[a.kind] || "📎";
+    let body;
+    if (a.kind === "table") {
+      const rows = a.content.trim().split("\n")
+        .filter((r) => r.trim() && !/^[\s|:+-]+$/.test(r))
+        .map((r) => r.trim().replace(/^\||\|$/g, "").split("|").map((x) => x.trim()));
+      body = `<div class="table-wrap"><table>${rows.map((r, i) =>
+        `<tr>${r.map((cell) => i === 0 ? `<th>${esc(cell)}</th>` : `<td>${esc(cell)}</td>`).join("")}</tr>`).join("")}</table></div>`;
+    } else {
+      body = `<div class="artifact-text">${esc(a.content)}</div>`;
+    }
+    return `<details class="artifact" ${open ? "open" : ""}><summary>${icon} ${esc(a.title)}</summary>${body}</details>`;
+  }
+
+  function renderSim(root, s, sim, onDone) {
+    const artifacts = (open) => s.artifacts.map((a) => artifactHtml(a, open)).join("");
+    const cpIdx = sim.phase === "cp0" ? 0 : 1;
+
+    if (sim.phase === "brief") {
+      root.innerHTML = `
+        <div class="sim-hud"><span>🎮 MISSION</span><span>Hands-on</span></div>
+        <h2 style="margin-top:6px">${esc(s.title)}</h2>
+        <p>${md(s.setting)}</p>
+        <div class="objective">🎯 <b>Your objective:</b> ${md(s.objective)}</div>
+        <span class="label">📎 Your files</span>
+        ${artifacts(false)}
+        <p class="muted small">All people, companies and data in this mission are fictional.</p>
+        <button class="btn primary block" id="simGo">Start mission 🚀</button>`;
+      $("#simGo", root).addEventListener("click", () => { sim.phase = s.checkpoints.length ? "cp0" : "build"; renderSim(root, s, sim, onDone); });
+    } else if (sim.phase === "cp0" || sim.phase === "cp1") {
+      const cp = s.checkpoints[cpIdx];
+      root.innerHTML = `
+        <div class="sim-hud"><span>⚠️ JUDGMENT CALL ${cpIdx + 1}</span><span>${cpIdx === 0 ? "Before you start" : "After the AI step"}</span></div>
+        <p style="font-size:17px;margin-top:8px">${md(cp.situation)}</p>
+        <div id="cpOpts">${cp.options.map((o, i) => `<button class="option" data-o="${i}">${md(o.text)}</button>`).join("")}</div>
+        <div id="cpFb"></div>`;
+      $$("#cpOpts .option", root).forEach((b) => b.addEventListener("click", () => {
+        if (sim.picks[cpIdx]) return;
+        const o = cp.options[+b.dataset.o];
+        sim.picks[cpIdx] = o.rating;
+        $$("#cpOpts .option", root).forEach((x, i) => {
+          const r = cp.options[i].rating;
+          if (r === "best") x.classList.add("correct");
+          if (x === b && r !== "best") x.classList.add(r === "okay" ? "okay" : "wrong");
+          x.disabled = true;
+        });
+        const best = cp.options.find((x) => x.rating === "best");
+        const label = { best: "🌟 Great call!", okay: "🤔 Workable, but not ideal.", risky: "🚨 Risky move." }[o.rating];
+        if (o.rating === "best") { addXP(5); confetti(50); }
+        $("#cpFb", root).innerHTML = `<div class="feedback ${o.rating === "best" ? "good" : "bad"}"><b>${label}</b> ${md(o.consequence)}
+          ${o.rating !== "best" && best ? `<p style="margin:8px 0 0"><b>Stronger move:</b> ${md(best.text)}. ${md(best.consequence)}</p>` : ""}</div>
+          <button class="btn primary block" id="cpNext" style="margin-top:12px">Continue mission →</button>`;
+        $("#cpNext", root).addEventListener("click", () => {
+          sim.phase = cpIdx === 0 ? "build" : "debrief";
+          if (sim.phase === "debrief") awardSim(sim);
+          renderSim(root, s, sim, onDone);
+          root.scrollIntoView({ behavior: "smooth" });
+        });
+      }));
+    } else if (sim.phase === "build") {
+      renderBuild(root, s, sim, () => {
+        sim.phase = s.checkpoints.length > 1 ? "cp1" : "debrief";
+        if (sim.phase === "debrief") awardSim(sim);
+        renderSim(root, s, sim, onDone);
+        root.scrollIntoView({ behavior: "smooth" });
+      });
+    } else if (sim.phase === "debrief") {
+      const score = simScore(sim);
+      const medal = score >= 85 ? "🥇" : score >= 65 ? "🥈" : "🥉";
+      root.innerHTML = `
+        <div class="center"><div class="badge-big" style="font-size:72px">${medal}</div>
+        <h2 style="margin-top:4px">Mission debrief</h2>
+        <div class="score-big">${score}<small>/100</small></div></div>
+        <div class="debrief-row"><span>🛠️ Build quality</span><b>${sim.best ?? 0}/100</b></div>
+        ${sim.picks.map((r, i) => `<div class="debrief-row"><span>⚠️ Judgment call ${i + 1}</span><b>${{ best: "🌟 Best", okay: "🤔 Okay", risky: "🚨 Risky" }[r]}</b></div>`).join("")}
+        <div class="debrief-row"><span>🔁 Attempts</span><b>${sim.attempts}</b></div>
+        <p class="muted small" style="margin-top:12px">${score >= 85 ? "You'd be ready to do this for real. 🚀" : "Tip: you can come back and replay this mission any time to beat your score."}</p>`;
+      onDone();
+    }
+  }
+
+  function awardSim(sim) {
+    if (sim.awarded) return;
+    sim.awarded = true;
+    addXP(XP.simDone + Math.round(simScore(sim) / 5));
+  }
+
+  function renderBuild(root, s, sim, next) {
+    const b = s.build;
+    const canAI = !!state.apiKey && navigator.onLine !== false;
+    const isPrompt = b.deliverable === "ai_prompt";
+    root.innerHTML = `
+      <div class="sim-hud"><span>🛠️ BUILD IT</span><span>${isPrompt ? "Write the prompt · AI runs it" : "Write your plan"}</span></div>
+      <p style="font-size:17px;margin-top:8px">${md(b.task)}</p>
+      <details class="artifact"><summary>📎 Files (${s.artifacts.length})</summary>${s.artifacts.map((a) => artifactHtml(a, true)).join("")}</details>
+      <details class="artifact"><summary>💡 Hint</summary><div class="artifact-text">${md(b.hint)}</div></details>
+      <textarea id="draft" class="field draft" placeholder="${isPrompt ? "Type the prompt you'd give the AI assistant…" : "Type your plan, step by step…"}">${esc(sim.draft)}</textarea>
+      <p class="muted small">🛡️ Practice space with fictional data. At work, use only approved tools.</p>
+      <div id="buildBtns"></div>
+      <div id="aiOut">${sim.aiOutput ? copilotHtml(sim.aiOutput) : ""}</div>
+      <div id="review">${sim.review ? reviewHtml(sim.review, s) : ""}</div>`;
+
+    const draft = $("#draft", root);
+    draft.addEventListener("input", () => { sim.draft = draft.value; });
+
+    const renderBtns = () => {
+      const btns = $("#buildBtns", root);
+      if (sim.busy) { btns.innerHTML = `<button class="btn block" disabled>⏳ Working…</button>`; return; }
+      btns.innerHTML = canAI
+        ? `<div class="row">${isPrompt ? `<button class="btn" id="runOnly">▶ Test run</button>` : ""}
+            <button class="btn primary" id="submit">${isPrompt ? "🚀 Run & get feedback" : "📝 Get feedback"}</button></div>
+           <button class="btn ghost small block" id="selfCheck" style="margin-top:8px">Check it myself instead</button>`
+        : `<button class="btn primary block" id="selfCheck">📝 Check my work</button>
+           <p class="muted small center">Add an API key in Profile to have AI run your work and coach you.</p>`;
+      $("#runOnly", root)?.addEventListener("click", () => go(false));
+      $("#submit", root)?.addEventListener("click", () => go(true));
+      $("#selfCheck", root).addEventListener("click", () => selfCheck());
+    };
+
+    const tooShort = () => {
+      if (sim.draft.trim().length >= 15) return false;
+      toast("Write a bit more first ✏️"); draft.focus(); return true;
+    };
+
+    const go = async (grade) => {
+      if (tooShort()) return;
+      sim.busy = true; renderBtns();
+      $("#review", root).innerHTML = "";
+      try {
+        if (isPrompt) {
+          $("#aiOut", root).innerHTML = copilotHtml("", true);
+          sim.aiOutput = await runLearnerPrompt(s, sim.draft, (text) => {
+            const el = $("#copilotText", root); if (el) el.textContent = text;
+          });
+          $("#aiOut", root).innerHTML = copilotHtml(sim.aiOutput);
+        }
+        if (grade) {
+          $("#review", root).innerHTML = `<div class="review"><div class="center muted">🧑‍🏫 Your coach is reviewing your work…</div></div>`;
+          const r = await gradeWork(s, sim.draft, isPrompt ? sim.aiOutput : "");
+          sim.attempts++;
+          sim.review = r;
+          sim.best = Math.max(sim.best ?? 0, r.score);
+          $("#review", root).innerHTML = reviewHtml(r, s);
+          if (r.score >= 85) confetti(90);
+          bindReview();
+          $("#review", root).scrollIntoView({ behavior: "smooth", block: "start" });
+        }
+      } catch (err) {
+        console.error(err);
+        $("#review", root).innerHTML = `<div class="feedback bad">🛸 ${esc(friendlyError(err))} You can retry, or check your work yourself.</div>`;
+      } finally {
+        sim.busy = false; renderBtns();
+      }
+    };
+
+    const selfCheck = () => {
+      if (tooShort()) return;
+      $("#review", root).innerHTML = `<div class="review">
+        <h3>📋 Self-check: tick what your answer covers</h3>
+        ${b.rubric.map((r, i) => `<label class="check"><input type="checkbox" data-r="${i}"> <span>${md(r)}</span></label>`).join("")}
+        <details class="artifact" open><summary>👀 Expert answer to compare</summary><div class="artifact-text">${esc(b.model_answer)}</div></details>
+        <button class="btn primary block" id="selfDone">Score my work</button></div>`;
+      $("#selfDone", root).addEventListener("click", () => {
+        const ticked = $$("[data-r]:checked", root).length;
+        const score = Math.round((ticked / Math.max(1, b.rubric.length)) * 100);
+        sim.attempts++;
+        sim.best = Math.max(sim.best ?? 0, score);
+        sim.review = {
+          score, headline: score >= 80 ? "Solid work!" : "Good start. Compare with the expert answer and try again.",
+          criteria: b.rubric.map((r, i) => ({ criterion: r, status: $(`[data-r="${i}"]`, root).checked ? "met" : "missed", feedback: "" })),
+          strength: "", next_step: "", improved_version: "", self: true,
+        };
+        $("#review", root).innerHTML = reviewHtml(sim.review, s);
+        bindReview();
+      });
+    };
+
+    const bindReview = () => {
+      $("#retry", root)?.addEventListener("click", () => { draft.focus(); draft.scrollIntoView({ behavior: "smooth", block: "center" }); });
+      $("#buildNext", root)?.addEventListener("click", next);
+    };
+
+    renderBtns();
+    bindReview();
+  }
+
+  function copilotHtml(text, loading) {
+    return `<div class="copilot"><div class="copilot-head">🤖 AI assistant output ${loading ? '<span class="typing"><i></i><i></i><i></i></span>' : ""}</div>
+      <div class="copilot-text" id="copilotText">${esc(text)}</div></div>`;
+  }
+
+  function reviewHtml(r, s) {
+    const icon = { met: "✅", partly: "🟡", missed: "❌" };
+    return `<div class="review">
+      <div class="review-top"><div class="ring big" style="--p:${r.score}"><span>${r.score}</span></div>
+        <div><b>${md(r.headline)}</b>${r.self ? "" : `<div class="muted small">AI coach feedback</div>`}</div></div>
+      <ul class="criteria">${r.criteria.map((c) => `<li><span>${icon[c.status] || "•"}</span><div><b>${md(c.criterion)}</b>${c.feedback ? `<div class="small muted">${md(c.feedback)}</div>` : ""}</div></li>`).join("")}</ul>
+      ${r.strength ? `<p class="small">💪 <b>What worked:</b> ${md(r.strength)}</p>` : ""}
+      ${r.next_step ? `<p class="small">🎯 <b>Level up:</b> ${md(r.next_step)}</p>` : ""}
+      ${r.improved_version ? `<details class="artifact"><summary>✨ Your answer, upgraded</summary><div class="artifact-text">${esc(r.improved_version)}</div></details>` : ""}
+      ${!r.self ? `<details class="artifact"><summary>👀 Expert answer</summary><div class="artifact-text">${esc(s.build.model_answer)}</div></details>` : ""}
+      <div class="row" style="margin-top:12px"><button class="btn" id="retry">✏️ Revise & retry</button><button class="btn primary" id="buildNext">Continue →</button></div>
+    </div>`;
+  }
+
+  const RUN_SYSTEM = `You are a general-purpose AI assistant being used inside a workplace training simulation. The attached workplace materials are fictional.
+
+Respond exactly as a capable AI assistant would to the user's request, using the attached materials when relevant. Follow the request as written: if it is vague, give a reasonable but generic answer rather than guessing what a trainer would want, so the learner sees the real effect of their prompt. Do not grade, coach or mention that this is a simulation. Keep the answer under 250 words unless the user asks for something longer. Plain text only; simple "-" bullets and line breaks are fine.`;
+
+  const GRADE_SYSTEM = `You are the coach in LearnAI, a hands-on AI training app for working professionals. You assess a learner's work on a simulated workplace task against a rubric.
+
+Give feedback that is specific and actionable: refer to what the learner actually wrote (and to what the AI produced from it, when provided), say exactly what to change, and keep it encouraging. Credit valid approaches that differ from the reference answer. Score honestly: 90+ excellent, 70-89 solid, 50-69 partial, under 50 missing key elements.
+
+Watch for safe-AI-use issues (sharing export-controlled or proprietary data, skipping human review of regulated decisions, trusting AI output without verification) and call them out when present.
+
+Write short, phone-friendly sentences. **bold** is the only markdown allowed. improved_version is the learner's own answer rewritten to score 90+, keeping their approach and voice.`;
+
+  const REVIEW_SCHEMA = obj({
+    score: { type: "integer" },
+    headline: str,
+    criteria: arr(obj({ criterion: str, status: { type: "string", enum: ["met", "partly", "missed"] }, feedback: str })),
+    strength: str,
+    next_step: str,
+    improved_version: str,
+  });
+
+  const materialsText = (s) => s.artifacts.map((a) => `<file title="${a.title}" type="${a.kind}">\n${a.content}\n</file>`).join("\n");
+
+  async function runLearnerPrompt(s, prompt, onText) {
+    const client = await getClient();
+    const stream = client.beta.messages.stream(buildParams({
+      system: RUN_SYSTEM,
+      user: `<attached_materials>\n${materialsText(s)}\n</attached_materials>\n\n${prompt}`,
+      maxTokens: 8000,
+      effort: "low",
+    }));
+    let text = "";
+    stream.on("text", (d) => { text += d; onText(text); });
+    return messageText(await stream.finalMessage());
+  }
+
+  async function gradeWork(s, work, aiOutput) {
+    const client = await getClient();
+    const b = s.build;
+    const user = `<scenario>\n${s.setting}\nObjective: ${s.objective}\n</scenario>
+<materials>\n${materialsText(s)}\n</materials>
+<task deliverable="${b.deliverable}">\n${b.task}\n</task>
+<rubric>\n${b.rubric.map((r, i) => `${i + 1}. ${r}`).join("\n")}\n</rubric>
+<reference_answer>\n${b.model_answer}\n</reference_answer>
+<learner_work>\n${work}\n</learner_work>
+${aiOutput ? `<ai_output_from_learner_prompt>\n${aiOutput}\n</ai_output_from_learner_prompt>` : ""}
+
+Assess the learner's work. Return one criteria entry per rubric item, in order, using the rubric text as the criterion.`;
+    const stream = client.beta.messages.stream(buildParams({ system: GRADE_SYSTEM, user, maxTokens: 16000, schema: REVIEW_SCHEMA }));
+    const r = JSON.parse(messageText(await stream.finalMessage()));
+    r.score = Math.max(0, Math.min(100, Math.round(r.score)));
+    return r;
+  }
+
+  function finishLesson(id, idx, score, simPts) {
     const c = getCourse(id);
-    const first = !c.progress[idx]?.done;
-    c.progress[idx] = { done: true, score: Math.max(score, c.progress[idx]?.score || 0) };
+    const prev = c.progress[idx] || {};
+    const first = !prev.done;
+    c.progress[idx] = {
+      done: true,
+      score: Math.max(score, prev.score || 0),
+      ...(simPts != null || prev.sim != null ? { sim: Math.max(simPts ?? 0, prev.sim ?? 0) } : {}),
+    };
     // Move the active course to the top of the list.
     state.courses = [c, ...state.courses.filter((x) => x.id !== id)];
     save();
@@ -663,18 +1012,20 @@ Number of lessons: exactly ${LENGTHS[p.length] || 3}. Each lesson should take 3-
     const lesson = c.course.lessons[idx];
     confetti(120);
     view(`
-      <div class="center" style="padding-top:30px">
+      <div class="center" style="padding-top:20px">
         <div class="badge-big">${score === lesson.quiz.length ? "🌟" : "✅"}</div>
         <h1>Lesson complete!</h1>
-        <p class="muted">Quiz score ${score}/${lesson.quiz.length} · +${(first ? XP.lessonDone : 0) + score * XP.correct} XP</p>
+        <p class="muted">${simPts != null ? `Mission ${simPts}/100 · ` : ""}Quiz ${score}/${lesson.quiz.length}</p>
         <div class="card" style="text-align:left"><b>${p.done}/${p.total} lessons done</b>
           <div class="level-bar" style="margin-top:10px"><div style="width:${p.pct}%"></div></div></div>
       </div>
+      ${lesson.simulation && lesson.try_it ? `<span class="step-tag">🏢 Take it to work this week</span><div class="card">${tryItHtml(lesson.try_it)}</div>` : ""}
       <div class="sticky-actions"><div class="inner">
         <button class="btn ghost" id="overview">Overview</button>
         ${idx + 1 < c.course.lessons.length ? `<button class="btn primary" id="nextLesson">Next lesson →</button>` : ""}
       </div></div>`);
     document.body.classList.add("in-lesson");
+    bindCopy(lesson.try_it);
     $("#overview").addEventListener("click", () => openCourse(id));
     $("#nextLesson")?.addEventListener("click", () => openLesson(id, idx + 1));
   }
